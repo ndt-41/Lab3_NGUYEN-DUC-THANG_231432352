@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Runner Monitor</title>
+<style>
+  :root { --bg:#0f172a; --card:#1e293b; --text:#e2e8f0; --muted:#94a3b8;
+          --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; --accent:#38bdf8; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, Segoe UI, Roboto, sans-serif;
+         background:var(--bg); color:var(--text); padding:16px; }
+  h1 { margin:0 0 4px; font-size:1.5rem; }
+  .sub { color:var(--muted); font-size:.9rem; margin-bottom:16px; }
+  .grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); }
+  .card { background:var(--card); border-radius:12px; padding:16px; }
+  .card h3 { margin:0 0 8px; font-size:.85rem; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:.05em; }
+  .value { font-size:2.2rem; font-weight:700; }
+  .unit { font-size:1rem; color:var(--muted); margin-left:4px; }
+  .charts { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); margin-top:14px; }
+  .chart-box { height:260px; position:relative; }
+  .status { display:inline-block; padding:4px 12px; border-radius:999px; font-weight:700; background:var(--ok); color:#052e16; }
+  .status.TEMP_HIGH, .status.ALT_JUMP { background:var(--bad); color:#fff; animation:blink .6s infinite; }
+  .status.TEMP_LOW { background:var(--warn); color:#451a03; animation:blink 1s infinite; }
+  @keyframes blink { 50% { opacity:.45; } }
+  .controls { display:flex; flex-wrap:wrap; gap:10px; margin-top:6px; }
+  button { border:0; border-radius:8px; padding:12px 18px; font-size:1rem; font-weight:600;
+           cursor:pointer; background:#334155; color:var(--text); transition:.15s; }
+  button:hover { filter:brightness(1.2); }
+  button.on { background:var(--ok); color:#052e16; }
+  button.auto { background:var(--accent); color:#082f49; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; background:var(--bad); margin-right:6px; }
+  .dot.ok { background:var(--ok); }
+  select { background:#334155; color:var(--text); border:0; border-radius:6px; padding:4px 8px; }
+  .row { display:flex; align-items:center; gap:8px; margin-top:6px; color:var(--muted); font-size:.9rem; }
+</style>
+</head>
+<body>
+
+<h1>🏃 Runner Monitor</h1>
+<div class="sub"><span id="connDot" class="dot"></span><span id="connText">Đang tải thư viện...</span></div>
+<div class="sub">
+  Broker: <select id="brokerSel"></select>
+  &nbsp;|&nbsp; Tin nhắn cuối từ ESP32: <b id="lastMsg">chưa có</b>
+</div>
+<div class="sub" id="hint" style="color:#fbbf24"></div>
+
+<div class="grid">
+  <div class="card"><h3>Nhiệt độ</h3><span class="value temp">--</span><span class="unit">°C</span></div>
+  <div class="card"><h3>Áp lực khí quyển</h3><span class="value pressure">--</span><span class="unit">hPa</span></div>
+  <div class="card"><h3>Độ cao (so với mực nước biển)</h3><span class="value altitude">--</span><span class="unit">m</span></div>
+  <div class="card"><h3>Trạng thái cảnh báo</h3>
+    <span class="status alarm" id="alarmBadge">--</span>
+    <div class="row">LED: <b class="ledState">--</b> &nbsp;|&nbsp; Loa: <b class="buzState">--</b></div>
+    <div class="row">Chế độ: <b class="modeState">--</b></div>
+  </div>
+</div>
+
+<div class="card" style="margin-top:14px">
+  <h3>Điều khiển (Manual)</h3>
+  <div class="controls">
+    <button id="btnLed">💡 LED: OFF</button>
+    <button id="btnBuz">🔔 LOA: OFF</button>
+    <button id="btnAuto" class="auto">⚙️ Về chế độ AUTO</button>
+  </div>
+  <div class="row">Bấm LED/LOA sẽ tự chuyển sang MANUAL. Bấm "AUTO" để ESP32 tự cảnh báo theo ngưỡng.</div>
+</div>
+
+<div class="charts">
+  <div class="card"><h3>Nhiệt độ (°C) - thời gian thực</h3><div class="chart-box"><canvas id="chartTemp"></canvas></div></div>
+  <div class="card"><h3>Độ cao (m) - thời gian thực</h3><div class="chart-box"><canvas id="chartAlt"></canvas></div></div>
+</div>
+
+<script>
+// ============ CAU HINH (topic phai khop voi sketch.ino) ============
+const PREFIX     = "runner_demo_2026/";
+const MAX_POINTS = 60;
+const BROKERS = {
+  hivemq: { label: "HiveMQ (broker.hivemq.com)", url: "wss://broker.hivemq.com:8884/mqtt" },
+  emqx:   { label: "EMQX (broker.emqx.io)",      url: "wss://broker.emqx.io:8084/mqtt" }
+};
+
+const $ = (sel) => document.querySelector(sel);
+const setText = (cls, v) => document.querySelectorAll("." + cls).forEach(e => e.textContent = v);
+
+// ============ TAI THU VIEN (thu nhieu CDN) ============
+function loadLib(urls, isLoaded) {
+  return new Promise((resolve) => {
+    let i = 0;
+    (function next() {
+      if (isLoaded()) return resolve(true);
+      if (i >= urls.length) return resolve(false);
+      const s = document.createElement("script");
+      s.src = urls[i++];
+      s.onload = next;
+      s.onerror = next;
+      document.head.appendChild(s);
+    })();
+  });
+}
+
+let chartTemp = null, chartAlt = null, client = null, ledOn = false, buzOn = false, hintTimer = null;
+
+function makeChart(canvasId, label, color) {
+  return new Chart($(canvasId), {
+    type: "line",
+    data: { labels: [], datasets: [{ label, data: [], borderColor: color,
+            backgroundColor: color + "33", fill: true, tension: .3, pointRadius: 0 }] },
+    options: { responsive: true, maintainAspectRatio: false, animation: false,
+      scales: { x: { ticks: { color: "#94a3b8", maxTicksLimit: 6 }, grid: { color: "#334155" } },
+                y: { ticks: { color: "#94a3b8" }, grid: { color: "#334155" } } },
+      plugins: { legend: { labels: { color: "#e2e8f0" } } } }
+  });
+}
+
+function pushPoint(chart, value) {
+  if (!chart) return;
+  chart.data.labels.push(new Date().toLocaleTimeString("vi-VN"));
+  chart.data.datasets[0].data.push(value);
+  if (chart.data.labels.length > MAX_POINTS) {
+    chart.data.labels.shift();
+    chart.data.datasets[0].data.shift();
+  }
+  chart.update();
+}
+
+// ============ MQTT ============
+function connectBroker(key) {
+  const b = BROKERS[key];
+  if (client) { client.end(true); }
+  clearTimeout(hintTimer);
+  $("#connDot").classList.remove("ok");
+  $("#connText").textContent = "Đang kết nối " + b.url + " ...";
+  $("#hint").textContent = "";
+
+  client = mqtt.connect(b.url, {
+    clientId: "web-runner-" + Math.random().toString(16).slice(2, 8),
+    reconnectPeriod: 3000, connectTimeout: 8000
+  });
+
+  // Sau 10 giay chua noi duoc -> goi y
+  hintTimer = setTimeout(() => {
+    if (!client.connected) {
+      $("#hint").textContent = "Chưa nối được " + b.label + ". Có thể mạng/trường đang chặn cổng này. " +
+        "Thử đổi broker ở ô chọn bên trên (nhớ đổi MQTT_SERVER trong code ESP32 cho khớp), hoặc đổi sang mạng 4G.";
+    }
+  }, 10000);
+
+  client.on("connect", () => {
+    clearTimeout(hintTimer);
+    $("#hint").textContent = "";
+    $("#connDot").classList.add("ok");
+    $("#connText").textContent = "Đã kết nối MQTT (" + b.url + ")";
+    client.subscribe(PREFIX + "#");
+  });
+  client.on("reconnect", () => { $("#connDot").classList.remove("ok"); $("#connText").textContent = "Đang kết nối lại..."; });
+  client.on("close",     () => { $("#connDot").classList.remove("ok"); if (!client.reconnecting) $("#connText").textContent = "Mất kết nối MQTT"; });
+  client.on("error",     (e) => { $("#connText").textContent = "Lỗi MQTT: " + e.message; });
+
+  client.on("message", (topic, payload) => {
+    const msg = payload.toString();
+    const key = topic.replace(PREFIX, "");
+    $("#lastMsg").textContent = new Date().toLocaleTimeString("vi-VN") + " (" + key + ")";
+
+    switch (key) {
+      case "temp":     setText("temp", msg);     pushPoint(chartTemp, parseFloat(msg)); break;
+      case "pressure": setText("pressure", msg); break;
+      case "altitude": setText("altitude", msg); pushPoint(chartAlt, parseFloat(msg));  break;
+      case "alarm": {
+        const badge = $("#alarmBadge");
+        badge.className = "status alarm " + msg;
+        badge.textContent = ({ NORMAL: "BÌNH THƯỜNG", TEMP_HIGH: "NÓNG QUÁ NGƯỠNG",
+                               TEMP_LOW: "LẠNH DƯỚI NGƯỠNG", ALT_JUMP: "ĐỘ CAO ĐỔI ĐỘT NGỘT" })[msg] || msg;
+        break;
+      }
+      case "led/state":
+        ledOn = (msg === "ON"); setText("ledState", msg);
+        $("#btnLed").textContent = "💡 LED: " + msg; $("#btnLed").classList.toggle("on", ledOn); break;
+      case "buzzer/state":
+        buzOn = (msg === "ON"); setText("buzState", msg);
+        $("#btnBuz").textContent = "🔔 LOA: " + msg; $("#btnBuz").classList.toggle("on", buzOn); break;
+      case "mode":
+        setText("modeState", msg); break;
+    }
+  });
+}
+
+// ============ NUT DIEU KHIEN ============
+function sendCmd(sub, value) {
+  if (!client || !client.connected) {
+    alert("Web chưa kết nối MQTT. Kiểm tra Internet rồi tải lại trang.");
+    return;
+  }
+  client.publish(PREFIX + sub, value, { qos: 0 }, (err) => {
+    if (err) alert("Gửi lệnh thất bại: " + err.message);
+    else console.log("Đã gửi", PREFIX + sub, value);
+  });
+}
+$("#btnLed").addEventListener("click",  () => sendCmd("cmd/led",    ledOn ? "OFF" : "ON"));
+$("#btnBuz").addEventListener("click",  () => sendCmd("cmd/buzzer", buzOn ? "OFF" : "ON"));
+$("#btnAuto").addEventListener("click", () => sendCmd("cmd/mode",   "AUTO"));
+
+// ============ KHOI DONG ============
+(async function start() {
+  const sel = $("#brokerSel");
+  for (const k in BROKERS) { const o = document.createElement("option"); o.value = k; o.textContent = BROKERS[k].label; sel.appendChild(o); }
+  try { const saved = localStorage.getItem("runnerBroker"); if (saved && BROKERS[saved]) sel.value = saved; } catch (e) {}
+
+  const [okMqtt, okChart] = await Promise.all([
+    loadLib(["https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js",
+             "https://cdnjs.cloudflare.com/ajax/libs/mqtt/5.10.1/mqtt.min.js"], () => typeof mqtt !== "undefined"),
+    loadLib(["https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js",
+             "https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"], () => typeof Chart !== "undefined")
+  ]);
+
+  if (!okMqtt) {
+    $("#connText").textContent = "Không tải được thư viện mqtt.js (CDN bị chặn hoặc không có Internet).";
+    $("#hint").textContent = "Mở file bằng Chrome trực tiếp từ máy (không mở trong khung xem trước), kiểm tra mạng, rồi tải lại trang (Ctrl+F5).";
+    return;
+  }
+  if (okChart) {
+    chartTemp = makeChart("#chartTemp", "Nhiệt độ (°C)", "#f97316");
+    chartAlt  = makeChart("#chartAlt",  "Độ cao (m)",    "#38bdf8");
+  }
+  sel.addEventListener("change", () => {
+    try { localStorage.setItem("runnerBroker", sel.value); } catch (e) {}
+    connectBroker(sel.value);
+  });
+  connectBroker(sel.value);
+})();
+</script>
+</body>
+</html>
